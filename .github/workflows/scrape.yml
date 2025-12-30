@@ -1,12 +1,12 @@
-name: Pegos Scraper -> HF Dataset
+name: Pegos Twitter Scraper (JSONL → HF)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # Manuel çalıştırma
   schedule:
     - cron: "0 */4 * * *"   # 4 saatte bir (UTC)
 
 jobs:
-  run:
+  run-scraper:
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -17,10 +17,10 @@ jobs:
       HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
