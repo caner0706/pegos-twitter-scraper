@@ -294,7 +294,7 @@ print("✅ Login başarılı:", driver.current_url)
 
 
 # ----------------------- SCRAPE (BOTH PASSES) -----------------------
-KEYWORDS = ["bitcoin", "blockchain", "cryptocurrency"]
+KEYWORDS = ["bitcoin",]
 
 # 1) default (genelde Top/son kullanılan sekme)
 # 2) live/latest
