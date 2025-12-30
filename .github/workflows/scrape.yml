@@ -1,7 +1,7 @@
-name: Pegos Twitter Scraper (JSONL → HF)
+name: Pegos Twitter Scraper (JSON → HF)
 
 on:
-  workflow_dispatch:   # Manuel çalıştırma
+  workflow_dispatch:
   schedule:
     - cron: "0 */4 * * *"   # 4 saatte bir (UTC)
 
@@ -33,3 +33,29 @@ jobs:
       - name: Run scraper
         run: |
           python scraper.py
+
+      - name: Upload data folder to Hugging Face dataset (MANDATORY)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: |
+          python - << 'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          token = os.environ.get("HF_TOKEN")
+          repo_id = os.environ.get("HF_REPO_ID")
+
+          if not token or not repo_id:
+            raise SystemExit("❌ HF_TOKEN veya HF_REPO_ID yok. Secrets tanımlarını kontrol et.")
+
+          api = HfApi()
+          api.upload_folder(
+              folder_path="data",
+              repo_id=repo_id,
+              repo_type="dataset",
+              token=token,
+              commit_message="GitHub Actions scrape update"
+          )
+          print("✅ HF UPLOAD DONE")
+          PY
