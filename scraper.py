@@ -1,232 +1,158 @@
 # =====================================================
-# Pegos Twitter Scraper (Default/Top-ish + Live, scroll-based)
-# JSONL run + daily + all, env-based tokens, optional HF upload
+# Pegos X(Twitter) Scraper - FINAL (Exact JSON Format)
+# - OUTPUT: JSON (array) -> run.json, latest.json, daily.json, all.json
+# - Tweets: keyword, tweet, time, comment, retweet, like, see_count, username, display_name,
+#          follower_count, following_count, comments_count, comments[]
+# - Comments: comment_text, comment_username, comment_like, comment_retweet, comment_reply,
+#            comment_view, comment_follower_count, comment_following_count
+# - REQUIRE: AUTH_TOKEN + CT0 env vars (GitHub Secrets / .env)
 # =====================================================
 
 import os
 import time
 import random
 import json
-import pandas as pd
-from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
+
+from bs4 import BeautifulSoup
+import pandas as pd
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Optional: HF upload
-try:
-    from huggingface_hub import HfApi
-    HF_AVAILABLE = True
-except Exception:
-    HF_AVAILABLE = False
+# -------------------- helpers --------------------
+def utc_now():
+    return datetime.now(timezone.utc)
 
-
-# ----------------------- helpers -----------------------
 def safe_int(val: str) -> int:
-    """Metin sayıları (3.5K, 1M, vb.) güvenli int'e çevirir."""
     if not val:
         return 0
-    val = str(val).replace(",", "").replace("·", "").strip()
+    v = str(val).replace(",", "").replace("·", "").strip()
     try:
-        if val.endswith("B"):  # bazı yerlerde K yerine B görülebiliyor
-            return int(float(val[:-1]) * 1_000)
-        if val.endswith("K"):
-            return int(float(val[:-1]) * 1_000)
-        if val.endswith("M") or val.endswith("Mn"):
-            return int(float(val[:-1]) * 1_000_000)
-        return int(float(val))
+        # K/M/B variants
+        if v.endswith("K"):
+            return int(float(v[:-1]) * 1_000)
+        if v.endswith("B"):  # sometimes used for thousand in some locales
+            return int(float(v[:-1]) * 1_000)
+        if v.endswith("M") or v.endswith("Mn"):
+            return int(float(v[:-1]) * 1_000_000)
+        return int(float(v))
     except:
         return 0
 
-
 def find_view_node(article):
-    """Tweet view sayısını yakalamak için alternatif testler."""
     v = article.find(attrs={"data-testid": ["viewCount", "views"]})
-    if v:
-        return v
+    if v: return v
     v = article.find("span", attrs={"aria-label": lambda s: s and "views" in s.lower()})
-    if v:
-        return v
+    if v: return v
     v = article.find("div", attrs={"aria-label": lambda s: s and "views" in s.lower()})
     return v
 
-
-def extract_user_info(article, driver=None, fetch_profile=False):
-    """Tweet sahibinin bilgilerini çıkarır (kullanıcı adı, takipçi, takip edilen)."""
-    user_info = {
-        "username": None,
-        "display_name": None,
-        "follower_count": 0,
-        "following_count": 0,
-    }
-
+def extract_user_info_from_article(article):
+    """
+    Best-effort:
+      - username from /<user> links under User-Name block
+      - display_name from span
+    """
+    out = {"username": None, "display_name": None}
     try:
-        user_link = article.find("a", href=lambda x: x and "/" in x and x.startswith("/"))
-        if user_link:
-            href = user_link.get("href", "")
-            if href.startswith("/") and not href.startswith("//") and "/status/" not in href:
-                parts = href.strip("/").split("/")
-                if parts and parts[0] and not parts[0].startswith("i/"):
-                    user_info["username"] = parts[0]
-
-            display_name_elem = user_link.find("span")
-            if display_name_elem:
-                user_info["display_name"] = display_name_elem.get_text(strip=True)
-
-        if not user_info["username"]:
-            user_elem = article.find(attrs={"data-testid": "User-Name"})
-            if user_elem:
-                links = user_elem.find_all("a")
-                for link in links:
-                    href = link.get("href", "")
-                    if href.startswith("/") and not href.startswith("//") and "/status/" not in href:
-                        parts = href.strip("/").split("/")
-                        if parts and parts[0] and not parts[0].startswith("i/"):
-                            user_info["username"] = parts[0]
-                            break
-
-        # Profil gezerek follower/following çekmek istersen (çok yavaş + riskli)
-        if fetch_profile and driver and user_info["username"]:
-            try:
-                profile_url = f"https://x.com/{user_info['username']}"
-                driver.get(profile_url)
-                time.sleep(2)
-                profile_html = driver.page_source
-                profile_soup = BeautifulSoup(profile_html, "html.parser")
-
-                follower_elem = profile_soup.find("a", href=lambda x: x and "/followers" in x)
-                if follower_elem:
-                    follower_text = follower_elem.get_text(strip=True)
-                    user_info["follower_count"] = safe_int(follower_text.split()[0] if follower_text else "0")
-
-                following_elem = profile_soup.find("a", href=lambda x: x and "/following" in x)
-                if following_elem:
-                    following_text = following_elem.get_text(strip=True)
-                    user_info["following_count"] = safe_int(following_text.split()[0] if following_text else "0")
-            except Exception:
-                pass
-
-    except Exception:
+        user_elem = article.find(attrs={"data-testid": "User-Name"})
+        if user_elem:
+            for link in user_elem.find_all("a", href=True):
+                href = link.get("href", "")
+                if href.startswith("/") and "/status/" not in href and not href.startswith("//"):
+                    parts = href.strip("/").split("/")
+                    if parts and parts[0] and not parts[0].startswith("i/"):
+                        out["username"] = parts[0]
+                        break
+            # display name (best effort)
+            span = user_elem.find("span")
+            if span:
+                out["display_name"] = span.get_text(strip=True)
+    except:
         pass
-
-    return user_info
-
-
-def extract_comments(tweet_url, driver, max_comments=5):
-    """Tweet detay sayfasına gidip yorumları çeker."""
-    comments = []
-    if not tweet_url:
-        return comments
-
-    try:
-        driver.get(tweet_url)
-        time.sleep(3)
-
-        for _ in range(3):
-            driver.execute_script("window.scrollBy(0, 800);")
-            time.sleep(1.5)
-
-        html = driver.page_source
-        soup = BeautifulSoup(html, "html.parser")
-        articles = soup.find_all("article")
-
-        # ilk article ana tweet; reply'lar 2. sıradan
-        for art in articles[1 : max_comments + 1]:
-            try:
-                comment_text_tag = art.find(attrs={"data-testid": "tweetText"})
-                if not comment_text_tag:
-                    continue
-
-                comment_text = comment_text_tag.get_text(" ", strip=True)
-                if len(comment_text) < 3:
-                    continue
-
-                comment_user_link = art.find("a", href=lambda x: x and "/" in x and x.startswith("/"))
-                comment_username = None
-                if comment_user_link:
-                    href = comment_user_link.get("href", "")
-                    if href.startswith("/") and not href.startswith("//") and "/status/" not in href:
-                        parts = href.strip("/").split("/")
-                        if parts and parts[0] and not parts[0].startswith("i/"):
-                            comment_username = parts[0]
-
-                comment_like = art.find(attrs={"data-testid": ["like", "favorite"]})
-                comment_like_count = safe_int(comment_like.get_text(strip=True) if comment_like else "0")
-
-                comment_retweet = art.find(attrs={"data-testid": ["retweet", "repost"]})
-                comment_retweet_count = safe_int(comment_retweet.get_text(strip=True) if comment_retweet else "0")
-
-                comment_time_tag = art.find("time")
-                comment_time = comment_time_tag["datetime"] if comment_time_tag else None
-
-                comments.append(
-                    {
-                        "comment_text": comment_text,
-                        "comment_username": comment_username,
-                        "comment_like": comment_like_count,
-                        "comment_retweet": comment_retweet_count,
-                        "comment_time": comment_time,
-                    }
-                )
-            except Exception:
-                continue
-
-    except Exception:
-        pass
-
-    return comments
-
-
-def read_jsonl(path: str):
-    if not os.path.exists(path):
-        return []
-    out = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                continue
     return out
 
+def extract_tweet_url(article):
+    try:
+        ttag = article.find("time")
+        if ttag:
+            a = ttag.find_parent("a")
+            if a:
+                href = a.get("href", "")
+                if href and "/status/" in href:
+                    return f"https://x.com{href}" if href.startswith("/") else href
+        for a in article.find_all("a", href=True):
+            href = a.get("href", "")
+            if "/status/" in href:
+                return f"https://x.com{href}" if href.startswith("/") else href
+    except:
+        pass
+    return None
 
-def write_jsonl(path: str, rows: list):
+def extract_tweet_id(tweet_url: str):
+    if not tweet_url:
+        return None
+    try:
+        parts = tweet_url.split("/status/")
+        if len(parts) < 2:
+            return None
+        tid = parts[1].split("?")[0].split("/")[0]
+        return tid or None
+    except:
+        return None
+
+def read_json_array(path: str):
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except:
+        return []
+
+def write_json_array(path: str, rows: list):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
+        json.dump(rows, f, ensure_ascii=False, indent=2)
 
 def dedupe_rows(rows: list):
-    """tweet_url varsa onunla; yoksa tweet+time+username ile dedupe."""
+    """
+    Strong dedupe:
+      - prefer tweet_id
+      - else tweet_url+time
+      - else tweet+time+username
+    """
     seen = set()
     out = []
     for r in rows:
-        tweet_url = (r.get("tweet_url") or "").strip()
+        tweet_id = (r.get("_tweet_id") or "").strip()
+        tweet_url = (r.get("_tweet_url") or "").strip()
         t = (r.get("time") or "").strip()
         tweet = (r.get("tweet") or "").strip()
         username = (r.get("username") or "").strip()
 
-        key = (tweet_url, t) if tweet_url else (tweet, t, username)
+        if tweet_id:
+            key = ("id", tweet_id)
+        elif tweet_url and t:
+            key = ("url_time", tweet_url, t)
+        else:
+            key = ("text_time_user", tweet, t, username)
+
         if key in seen:
             continue
         seen.add(key)
         out.append(r)
     return out
 
-
-# ----------------------- ENV & PATHS -----------------------
-print("✅ Kütüphaneler ve fonksiyonlar yüklendi.")
-
+# -------------------- ENV (NO hardcoded tokens) --------------------
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")
 CT0 = os.getenv("CT0")
 
-# Lokal için .env desteği
 if (not AUTH_TOKEN or not CT0):
     try:
         from dotenv import load_dotenv
@@ -237,224 +163,353 @@ if (not AUTH_TOKEN or not CT0):
         pass
 
 if not AUTH_TOKEN or not CT0:
-    raise RuntimeError("❌ AUTH_TOKEN veya CT0 yok. GitHub Secrets veya .env ile ver.")
+    raise RuntimeError("❌ AUTH_TOKEN / CT0 missing. Set as environment variables (GitHub Secrets) or .env.")
 
-# Opsiyonel HF upload
+# optional HF upload (if you use it elsewhere)
 HF_TOKEN = os.getenv("HF_TOKEN")
-HF_REPO_ID = os.getenv("HF_REPO_ID")  # örn: caner0706/pegos-twitter-data
+HF_REPO_ID = os.getenv("HF_REPO_ID")
 
-# Kontrol edilebilir parametreler
-SCROLLS = int(os.getenv("SCROLLS", "60"))
-ENABLE_COMMENTS = os.getenv("ENABLE_COMMENTS", "1").strip() in ("1", "true", "True", "yes", "YES")
+# -------------------- knobs --------------------
+KEYWORDS = ["bitcoin",]
+MODES = ["", "&f=live"]  # default + live together
 
-TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-RUN_STAMP = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+# Max data scroll behavior
+SCROLLS_MAX = int(os.getenv("SCROLLS_MAX", "160"))
+SCROLL_STEP_PX = int(os.getenv("SCROLL_STEP_PX", "1400"))
+STOP_AFTER_NO_NEW = int(os.getenv("STOP_AFTER_NO_NEW", "12"))
+PAGE_WAIT = float(os.getenv("PAGE_WAIT", "6"))
+SCROLL_WAIT_MIN = float(os.getenv("SCROLL_WAIT_MIN", "1.8"))
+SCROLL_WAIT_MAX = float(os.getenv("SCROLL_WAIT_MAX", "3.0"))
+
+# Profile fetch (REAL follower/following)
+PROFILE_RETRIES = int(os.getenv("PROFILE_RETRIES", "2"))
+PROFILE_WAIT_MIN = float(os.getenv("PROFILE_WAIT_MIN", "1.4"))
+PROFILE_WAIT_MAX = float(os.getenv("PROFILE_WAIT_MAX", "2.6"))
+
+# Comment depth (this is expensive; but you asked "kesin")
+MAX_COMMENTS_PER_TWEET = int(os.getenv("MAX_COMMENTS_PER_TWEET", "9"))
+COMMENTS_SCROLL_PASSES = int(os.getenv("COMMENTS_SCROLL_PASSES", "3"))
+COMMENTS_SCROLL_STEP_PX = int(os.getenv("COMMENTS_SCROLL_STEP_PX", "900"))
+COMMENTS_WAIT_MIN = float(os.getenv("COMMENTS_WAIT_MIN", "1.2"))
+COMMENTS_WAIT_MAX = float(os.getenv("COMMENTS_WAIT_MAX", "1.8"))
+
+# -------------------- paths --------------------
+TODAY = utc_now().strftime("%Y-%m-%d")
+RUN_STAMP = utc_now().strftime("%Y%m%dT%H%M%SZ")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 OUT_DIR = os.path.join(SCRIPT_DIR, "data", TODAY)
 RUNS_DIR = os.path.join(OUT_DIR, "runs")
 ALL_DIR = os.path.join(SCRIPT_DIR, "data", "all")
 
-RUN_JSONL = os.path.join(RUNS_DIR, f"{RUN_STAMP}.jsonl")
-LATEST_JSONL = os.path.join(OUT_DIR, "latest.jsonl")
-DAILY_JSONL = os.path.join(OUT_DIR, "daily.jsonl")
-ALL_JSONL = os.path.join(ALL_DIR, "all.jsonl")
+RUN_JSON = os.path.join(RUNS_DIR, f"{RUN_STAMP}.json")
+LATEST_JSON = os.path.join(OUT_DIR, "latest.json")
+DAILY_JSON = os.path.join(OUT_DIR, "daily.json")
+ALL_JSON = os.path.join(ALL_DIR, "all.json")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(RUNS_DIR, exist_ok=True)
 os.makedirs(ALL_DIR, exist_ok=True)
 
-print("📁 OUT_DIR:", OUT_DIR)
-print("🕒 RUN_STAMP:", RUN_STAMP)
-print("🔁 SCROLLS:", SCROLLS, "| 💬 ENABLE_COMMENTS:", ENABLE_COMMENTS)
+# -------------------- driver --------------------
+def make_driver():
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
+def login_with_cookies(driver):
+    driver.get("https://x.com")
+    time.sleep(3)
+    driver.add_cookie({"name": "auth_token", "value": AUTH_TOKEN, "domain": ".x.com"})
+    driver.add_cookie({"name": "ct0", "value": CT0, "domain": ".x.com"})
+    driver.refresh()
+    time.sleep(5)
 
-# ----------------------- BROWSER -----------------------
-opts = Options()
-opts.add_argument("--headless=new")
-opts.add_argument("--no-sandbox")
-opts.add_argument("--disable-gpu")
-opts.add_argument("--disable-dev-shm-usage")
-opts.add_argument("--window-size=1920,1080")
-opts.add_argument("--disable-blink-features=AutomationControlled")
-opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-opts.add_experimental_option("useAutomationExtension", False)
+# -------------------- profile fetch (cached) --------------------
+_profile_cache = {}
 
-driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+def fetch_profile_counts(driver, username: str):
+    if not username:
+        return 0, 0
+    if username in _profile_cache:
+        return _profile_cache[username]
 
-driver.get("https://x.com")
-time.sleep(3)
-driver.add_cookie({"name": "auth_token", "value": AUTH_TOKEN, "domain": ".x.com"})
-driver.add_cookie({"name": "ct0", "value": CT0, "domain": ".x.com"})
-driver.refresh()
-time.sleep(5)
+    follower_count, following_count = 0, 0
 
-print("✅ Login başarılı:", driver.current_url)
+    for _ in range(PROFILE_RETRIES + 1):
+        try:
+            driver.get(f"https://x.com/{username}")
+            time.sleep(random.uniform(PROFILE_WAIT_MIN, PROFILE_WAIT_MAX))
+            html = driver.page_source or ""
+            if ("Something went wrong" in html) or ("Try again" in html) or (len(html) < 5000):
+                time.sleep(random.uniform(2.0, 4.0))
+                continue
 
-
-# ----------------------- SCRAPE (BOTH PASSES) -----------------------
-KEYWORDS = ["bitcoin",]
-
-# 1) default (genelde Top/son kullanılan sekme)
-# 2) live/latest
-SEARCH_PASSES = [
-    {"name": "default", "suffix": ""},          # f parametresi yok
-    {"name": "live", "suffix": "&f=live"},      # Latest
-]
-
-tweetArr = []
-
-for kw in KEYWORDS:
-    for sp in SEARCH_PASSES:
-        print(f"\n🔎 {kw} | pass={sp['name']}")
-        driver.get(f"https://x.com/search?q={kw}&src=typed_query{sp['suffix']}")
-        time.sleep(6)
-
-        seen = set()
-        for _ in range(SCROLLS):
-            driver.execute_script("window.scrollBy(0, 1200);")
-            time.sleep(random.uniform(2.0, 3.2))
-            html = driver.page_source
             soup = BeautifulSoup(html, "html.parser")
 
-            for art in soup.find_all("article"):
-                try:
-                    text_tag = art.find(attrs={"data-testid": "tweetText"})
-                    if not text_tag:
-                        continue
-                    text = text_tag.get_text(" ", strip=True)
-                    if len(text) < 8:
-                        continue
+            follower_elem = soup.find("a", href=lambda x: x and x.endswith("/followers"))
+            if follower_elem:
+                follower_text = follower_elem.get_text(" ", strip=True)
+                follower_count = safe_int(follower_text.split()[0] if follower_text else "0")
 
-                    ttag = art.find("time")
-                    tstr = ttag["datetime"] if ttag else None
+            following_elem = soup.find("a", href=lambda x: x and x.endswith("/following"))
+            if following_elem:
+                following_text = following_elem.get_text(" ", strip=True)
+                following_count = safe_int(following_text.split()[0] if following_text else "0")
 
-                    # run içi duplicate engeli (aynı sayfa içinde)
-                    key = (text, tstr)
-                    if key in seen:
-                        continue
-                    seen.add(key)
+            if follower_count or following_count:
+                break
 
-                    # Tweet URL
-                    tweet_url = None
-                    time_link = ttag.find_parent("a") if ttag else None
-                    if time_link:
-                        href = time_link.get("href", "")
-                        if href.startswith("/"):
-                            tweet_url = f"https://x.com{href}"
+        except:
+            time.sleep(random.uniform(2.0, 4.0))
 
-                    if not tweet_url:
-                        for link in art.find_all("a", href=True):
-                            href = link.get("href", "")
-                            if "/status/" in href:
-                                tweet_url = f"https://x.com{href}" if href.startswith("/") else href
-                                break
+    _profile_cache[username] = (follower_count, following_count)
+    return follower_count, following_count
 
-                    reply = art.find(attrs={"data-testid": ["reply", "conversation"]})
-                    retw = art.find(attrs={"data-testid": ["retweet", "repost"]})
-                    like = art.find(attrs={"data-testid": ["like", "favorite"]})
-                    view = find_view_node(art)
+# -------------------- comments extraction (with metrics) --------------------
+def extract_comment_username(comment_article):
+    try:
+        user_elem = comment_article.find(attrs={"data-testid": "User-Name"})
+        if user_elem:
+            for link in user_elem.find_all("a", href=True):
+                href = link.get("href", "")
+                if href.startswith("/") and "/status/" not in href and not href.startswith("//"):
+                    parts = href.strip("/").split("/")
+                    if parts and parts[0] and not parts[0].startswith("i/"):
+                        return parts[0]
+        # fallback
+        a = comment_article.find("a", href=lambda x: x and x.startswith("/") and "/status/" not in x)
+        if a:
+            href = a.get("href", "")
+            parts = href.strip("/").split("/")
+            if parts and parts[0] and not parts[0].startswith("i/"):
+                return parts[0]
+    except:
+        pass
+    return None
 
-                    user_info = extract_user_info(art, driver, fetch_profile=False)
+def extract_comments(tweet_url, driver, max_comments=9):
+    comments = []
+    if not tweet_url:
+        return comments
 
-                    comments_data = []
-                    if ENABLE_COMMENTS and tweet_url:
-                        try:
-                            comments_data = extract_comments(tweet_url, driver, max_comments=5)
-                            driver.back()
-                            time.sleep(2)
-                        except Exception as e:
-                            print(f"⚠️ Yorum çekme hatası: {e}")
-                            try:
-                                driver.back()
-                                time.sleep(1)
-                            except:
-                                pass
+    try:
+        driver.get(tweet_url)
+        time.sleep(3)
 
-                    tweet_data = {
-                        "pass": sp["name"],  # default / live bilgisi
-                        "keyword": kw,
-                        "tweet": text,
-                        "time": tstr,
-                        "tweet_url": tweet_url,
-                        "comment": safe_int(reply.get_text(strip=True) if reply else "0"),
-                        "retweet": safe_int(retw.get_text(strip=True) if retw else "0"),
-                        "like": safe_int(like.get_text(strip=True) if like else "0"),
-                        "see_count": safe_int(view.get_text(strip=True) if view else "0"),
-                        "username": user_info["username"],
-                        "display_name": user_info["display_name"],
-                        "follower_count": user_info["follower_count"],
-                        "following_count": user_info["following_count"],
-                        "comments_count": len(comments_data),
-                        "comments_data": comments_data,  # JSON olarak (string değil)
-                    }
+        # Scroll to load replies
+        for _ in range(COMMENTS_SCROLL_PASSES):
+            driver.execute_script(f"window.scrollBy(0, {COMMENTS_SCROLL_STEP_PX});")
+            time.sleep(random.uniform(COMMENTS_WAIT_MIN, COMMENTS_WAIT_MAX))
 
-                    tweetArr.append(tweet_data)
-                    time.sleep(random.uniform(0.4, 0.9))
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        arts = soup.find_all("article")
 
-                except Exception as e:
-                    print(f"⚠️ Tweet işleme hatası: {e}")
+        # First is main tweet. Others are replies.
+        for art in arts[1:]:
+            if len(comments) >= max_comments:
+                break
+            try:
+                txt = art.find(attrs={"data-testid": "tweetText"})
+                if not txt:
+                    continue
+                comment_text = txt.get_text(" ", strip=True)
+                if len(comment_text) < 1:
                     continue
 
-        print(f"✅ {kw}/{sp['name']}: {len(tweetArr)} toplam kayıt (kümülatif)")
+                comment_username = extract_comment_username(art)
 
-driver.quit()
-print(f"🟢 Toplam tweet sayısı (kümülatif): {len(tweetArr)}")
+                like = art.find(attrs={"data-testid": ["like", "favorite"]})
+                rt = art.find(attrs={"data-testid": ["retweet", "repost"]})
+                rp = art.find(attrs={"data-testid": ["reply", "conversation"]})
+                vw = find_view_node(art)
 
+                c_followers, c_following = fetch_profile_counts(driver, comment_username) if comment_username else (0, 0)
 
-# ----------------------- SAVE (JSONL run + daily + all) -----------------------
-df = pd.DataFrame(tweetArr)
+                comments.append({
+                    "comment_text": comment_text,
+                    "comment_username": comment_username,
+                    "comment_like": safe_int(like.get_text(strip=True) if like else "0"),
+                    "comment_retweet": safe_int(rt.get_text(strip=True) if rt else "0"),
+                    "comment_reply": safe_int(rp.get_text(strip=True) if rp else "0"),
+                    "comment_view": safe_int(vw.get_text(strip=True) if vw else "0"),
+                    "comment_follower_count": c_followers,
+                    "comment_following_count": c_following
+                })
+            except:
+                continue
 
-if not df.empty:
-    df.drop_duplicates(subset=["tweet", "time", "tweet_url"], inplace=False)
-    sort_cols = [c for c in ["like", "retweet", "comment", "see_count"] if c in df.columns]
-    if sort_cols:
-        df.sort_values(by=sort_cols, ascending=False, inplace=True)
-else:
-    df = pd.DataFrame(columns=[
-        "pass", "keyword", "tweet", "time", "tweet_url",
-        "comment", "retweet", "like", "see_count",
-        "username", "display_name", "follower_count", "following_count",
-        "comments_count", "comments_data"
-    ])
+    except:
+        pass
 
-rows = df.to_dict(orient="records")
+    return comments
 
-# 1) run
-write_jsonl(RUN_JSONL, rows)
+# -------------------- scraping --------------------
+def scrape_keyword_mode(driver, keyword: str, mode_suffix: str):
+    """
+    mode_suffix: "" (default) or "&f=live"
+    """
+    q = keyword
+    url = f"https://x.com/search?q={quote_plus(q)}&src=typed_query{mode_suffix}"
+    driver.get(url)
+    time.sleep(PAGE_WAIT)
 
-# 2) latest (overwrite)
-write_jsonl(LATEST_JSONL, rows)
+    out = []
+    seen_local = set()
 
-# 3) daily merge + dedupe
-daily_old = read_jsonl(DAILY_JSONL)
-daily_new = dedupe_rows(daily_old + rows)
-write_jsonl(DAILY_JSONL, daily_new)
+    no_new_streak = 0
+    last_total = 0
 
-# 4) all merge + dedupe
-all_old = read_jsonl(ALL_JSONL)
-all_new = dedupe_rows(all_old + rows)
-write_jsonl(ALL_JSONL, all_new)
+    for i in range(SCROLLS_MAX):
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        articles = soup.find_all("article")
+        added_this_round = 0
 
-print(f"💾 RUN:    {RUN_JSONL} ({len(rows)} satır)")
-print(f"💾 LATEST: {LATEST_JSONL} ({len(rows)} satır)")
-print(f"💾 DAILY:  {DAILY_JSONL} ({len(daily_new)} satır)")
-print(f"💾 ALL:    {ALL_JSONL} ({len(all_new)} satır)")
+        for art in articles:
+            try:
+                text_tag = art.find(attrs={"data-testid": "tweetText"})
+                if not text_tag:
+                    continue
+                text = text_tag.get_text(" ", strip=True)
+                if len(text) < 2:
+                    continue
 
-# 5) optional HF upload
-if HF_TOKEN and HF_REPO_ID and HF_AVAILABLE:
+                ttag = art.find("time")
+                tstr = ttag["datetime"] if ttag and ttag.has_attr("datetime") else None
+
+                tweet_url = extract_tweet_url(art)
+                tweet_id = extract_tweet_id(tweet_url)
+
+                key = ("id", tweet_id) if tweet_id else (tweet_url, tstr, text)
+                if key in seen_local:
+                    continue
+                seen_local.add(key)
+
+                reply = art.find(attrs={"data-testid": ["reply", "conversation"]})
+                retw = art.find(attrs={"data-testid": ["retweet", "repost"]})
+                like = art.find(attrs={"data-testid": ["like", "favorite"]})
+                view = find_view_node(art)
+
+                ui = extract_user_info_from_article(art)
+                username = ui.get("username")
+                display_name = ui.get("display_name")
+
+                # REAL follower/following
+                follower_count, following_count = fetch_profile_counts(driver, username) if username else (0, 0)
+
+                # Comments (REAL + metrics)
+                comments = extract_comments(tweet_url, driver, max_comments=MAX_COMMENTS_PER_TWEET) if tweet_url else []
+
+                out.append({
+                    "_tweet_id": tweet_id,
+                    "_tweet_url": tweet_url,
+
+                    "keyword": keyword,
+                    "tweet": text,
+                    "time": tstr,
+                    "comment": safe_int(reply.get_text(strip=True) if reply else "0"),
+                    "retweet": safe_int(retw.get_text(strip=True) if retw else "0"),
+                    "like": safe_int(like.get_text(strip=True) if like else "0"),
+                    "see_count": safe_int(view.get_text(strip=True) if view else "0"),
+                    "username": username,
+                    "display_name": display_name,
+                    "follower_count": follower_count,
+                    "following_count": following_count,
+                    "comments_count": len(comments),
+                    "comments": comments
+                })
+
+                added_this_round += 1
+                time.sleep(random.uniform(0.4, 0.9))  # throttle
+
+                # after visiting tweet_url (comments) we are not on search page anymore
+                # go back to search results
+                try:
+                    driver.back()
+                    time.sleep(random.uniform(1.2, 2.0))
+                except:
+                    pass
+
+            except:
+                continue
+
+        if len(out) == last_total:
+            no_new_streak += 1
+        else:
+            no_new_streak = 0
+            last_total = len(out)
+
+        if no_new_streak >= STOP_AFTER_NO_NEW:
+            break
+
+        driver.execute_script(f"window.scrollBy(0, {SCROLL_STEP_PX});")
+        time.sleep(random.uniform(SCROLL_WAIT_MIN, SCROLL_WAIT_MAX))
+
+    return out
+
+def strip_internal_fields(rows: list):
+    for r in rows:
+        r.pop("_tweet_id", None)
+        r.pop("_tweet_url", None)
+    return rows
+
+# -------------------- main --------------------
+def main():
+    driver = make_driver()
     try:
-        api = HfApi()
-        api.upload_folder(
-            folder_path=os.path.join(SCRIPT_DIR, "data"),
-            repo_id=HF_REPO_ID,
-            repo_type="dataset",
-            token=HF_TOKEN,
-            commit_message=f"Scrape {TODAY} {RUN_STAMP} | run={len(rows)} daily={len(daily_new)} all={len(all_new)}"
-        )
-        print("✅ HF upload tamamlandı.")
-    except Exception as e:
-        print(f"⚠️ HF upload hatası: {e}")
-else:
-    print("ℹ️ HF upload atlandı (HF_TOKEN/HF_REPO_ID yok veya huggingface_hub yok).")
+        login_with_cookies(driver)
+
+        collected = []
+        for kw in KEYWORDS:
+            for mode_suffix in MODES:
+                collected.extend(scrape_keyword_mode(driver, kw, mode_suffix))
+
+        # dedupe + sort (optional)
+        collected = dedupe_rows(collected)
+        df = pd.DataFrame(collected)
+        if not df.empty:
+            sort_cols = [c for c in ["like", "retweet", "comment", "see_count"] if c in df.columns]
+            if sort_cols:
+                df.sort_values(by=sort_cols, ascending=False, inplace=True)
+            rows = df.to_dict(orient="records")
+        else:
+            rows = []
+
+        rows = strip_internal_fields(rows)
+
+        # save run + latest
+        write_json_array(RUN_JSON, rows)
+        write_json_array(LATEST_JSON, rows)
+
+        # daily append+dedupe
+        daily_old = read_json_array(DAILY_JSON)
+        daily_new = dedupe_rows(daily_old + rows)
+        daily_new = strip_internal_fields(daily_new)
+        write_json_array(DAILY_JSON, daily_new)
+
+        # all append+dedupe
+        all_old = read_json_array(ALL_JSON)
+        all_new = dedupe_rows(all_old + rows)
+        all_new = strip_internal_fields(all_new)
+        write_json_array(ALL_JSON, all_new)
+
+        print(f"✅ RUN   : {RUN_JSON}   ({len(rows)})")
+        print(f"✅ LATEST: {LATEST_JSON} ({len(rows)})")
+        print(f"✅ DAILY : {DAILY_JSON}  ({len(daily_new)})")
+        print(f"✅ ALL   : {ALL_JSON}    ({len(all_new)})")
+
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
