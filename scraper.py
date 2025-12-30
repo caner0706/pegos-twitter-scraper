@@ -1,18 +1,22 @@
 # =====================================================
-# Pegos Twitter Scraper (Top + Live, robust counts, always-save)
-# MIN CHANGES: token/env fix + JSONL save (+ optional HF upload)
+# Pegos Twitter Scraper (Default/Top-ish + Live, scroll-based)
+# JSONL run + daily + all, env-based tokens, optional HF upload
 # =====================================================
-import os, time, random
+
+import os
+import time
+import random
 import json
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-# (Optional) HF upload
+# Optional: HF upload
 try:
     from huggingface_hub import HfApi
     HF_AVAILABLE = True
@@ -20,15 +24,18 @@ except Exception:
     HF_AVAILABLE = False
 
 
-def safe_int(val: str):
+# ----------------------- helpers -----------------------
+def safe_int(val: str) -> int:
     """Metin sayıları (3.5K, 1M, vb.) güvenli int'e çevirir."""
     if not val:
         return 0
-    val = str(val).replace(',', '').replace('·', '').strip()
+    val = str(val).replace(",", "").replace("·", "").strip()
     try:
-        if val.endswith('B'):
+        if val.endswith("B"):  # bazı yerlerde K yerine B görülebiliyor
             return int(float(val[:-1]) * 1_000)
-        if val.endswith('M') or val.endswith('Mn'):
+        if val.endswith("K"):
+            return int(float(val[:-1]) * 1_000)
+        if val.endswith("M") or val.endswith("Mn"):
             return int(float(val[:-1]) * 1_000_000)
         return int(float(val))
     except:
@@ -38,9 +45,11 @@ def safe_int(val: str):
 def find_view_node(article):
     """Tweet view sayısını yakalamak için alternatif testler."""
     v = article.find(attrs={"data-testid": ["viewCount", "views"]})
-    if v: return v
+    if v:
+        return v
     v = article.find("span", attrs={"aria-label": lambda s: s and "views" in s.lower()})
-    if v: return v
+    if v:
+        return v
     v = article.find("div", attrs={"aria-label": lambda s: s and "views" in s.lower()})
     return v
 
@@ -51,7 +60,7 @@ def extract_user_info(article, driver=None, fetch_profile=False):
         "username": None,
         "display_name": None,
         "follower_count": 0,
-        "following_count": 0
+        "following_count": 0,
     }
 
     try:
@@ -79,6 +88,7 @@ def extract_user_info(article, driver=None, fetch_profile=False):
                             user_info["username"] = parts[0]
                             break
 
+        # Profil gezerek follower/following çekmek istersen (çok yavaş + riskli)
         if fetch_profile and driver and user_info["username"]:
             try:
                 profile_url = f"https://x.com/{user_info['username']}"
@@ -105,10 +115,9 @@ def extract_user_info(article, driver=None, fetch_profile=False):
     return user_info
 
 
-def extract_comments(tweet_url, driver, max_comments=10):
+def extract_comments(tweet_url, driver, max_comments=5):
     """Tweet detay sayfasına gidip yorumları çeker."""
     comments = []
-
     if not tweet_url:
         return comments
 
@@ -122,10 +131,10 @@ def extract_comments(tweet_url, driver, max_comments=10):
 
         html = driver.page_source
         soup = BeautifulSoup(html, "html.parser")
-
         articles = soup.find_all("article")
 
-        for art in articles[1:max_comments + 1]:
+        # ilk article ana tweet; reply'lar 2. sıradan
+        for art in articles[1 : max_comments + 1]:
             try:
                 comment_text_tag = art.find(attrs={"data-testid": "tweetText"})
                 if not comment_text_tag:
@@ -153,17 +162,15 @@ def extract_comments(tweet_url, driver, max_comments=10):
                 comment_time_tag = art.find("time")
                 comment_time = comment_time_tag["datetime"] if comment_time_tag else None
 
-                comments.append({
-                    "comment_text": comment_text,
-                    "comment_username": comment_username,
-                    "comment_like": comment_like_count,
-                    "comment_retweet": comment_retweet_count,
-                    "comment_time": comment_time
-                })
-
-                if len(comments) >= max_comments:
-                    break
-
+                comments.append(
+                    {
+                        "comment_text": comment_text,
+                        "comment_username": comment_username,
+                        "comment_like": comment_like_count,
+                        "comment_retweet": comment_retweet_count,
+                        "comment_time": comment_time,
+                    }
+                )
             except Exception:
                 continue
 
@@ -173,16 +180,53 @@ def extract_comments(tweet_url, driver, max_comments=10):
     return comments
 
 
+def read_jsonl(path: str):
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def write_jsonl(path: str, rows: list):
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def dedupe_rows(rows: list):
+    """tweet_url varsa onunla; yoksa tweet+time+username ile dedupe."""
+    seen = set()
+    out = []
+    for r in rows:
+        tweet_url = (r.get("tweet_url") or "").strip()
+        t = (r.get("time") or "").strip()
+        tweet = (r.get("tweet") or "").strip()
+        username = (r.get("username") or "").strip()
+
+        key = (tweet_url, t) if tweet_url else (tweet, t, username)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+# ----------------------- ENV & PATHS -----------------------
 print("✅ Kütüphaneler ve fonksiyonlar yüklendi.")
-
-
-# ======================= ENV & PATHS (MIN CHANGE: token güvenli) =======================
-# Cookie'ler sadece ENV/.env'den gelsin (hardcode YOK)
 
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")
 CT0 = os.getenv("CT0")
 
-# .env (opsiyonel)
+# Lokal için .env desteği
 if (not AUTH_TOKEN or not CT0):
     try:
         from dotenv import load_dotenv
@@ -195,30 +239,26 @@ if (not AUTH_TOKEN or not CT0):
 if not AUTH_TOKEN or not CT0:
     raise RuntimeError("❌ AUTH_TOKEN veya CT0 yok. GitHub Secrets veya .env ile ver.")
 
-# HF (opsiyonel)
+# Opsiyonel HF upload
 HF_TOKEN = os.getenv("HF_TOKEN")
 HF_REPO_ID = os.getenv("HF_REPO_ID")  # örn: caner0706/pegos-twitter-data
+
+# Kontrol edilebilir parametreler
+SCROLLS = int(os.getenv("SCROLLS", "60"))
+ENABLE_COMMENTS = os.getenv("ENABLE_COMMENTS", "1").strip() in ("1", "true", "True", "yes", "YES")
 
 TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 RUN_STAMP = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Günlük klasör: data/YYYY-MM-DD
 OUT_DIR = os.path.join(SCRIPT_DIR, "data", TODAY)
-
-# Run dosyaları: data/YYYY-MM-DD/runs/TIMESTAMP.jsonl
 RUNS_DIR = os.path.join(OUT_DIR, "runs")
-RUN_JSONL = os.path.join(RUNS_DIR, f"{RUN_STAMP}.jsonl")
-
-# Günlük birleşik: data/YYYY-MM-DD/daily.jsonl  (overwrite)
-DAILY_JSONL = os.path.join(OUT_DIR, "daily.jsonl")
-
-# Son gelen run: data/YYYY-MM-DD/latest.jsonl (overwrite)
-LATEST_JSONL = os.path.join(OUT_DIR, "latest.jsonl")
-
-# Tüm zamanlar birleşik: data/all/all.jsonl (overwrite)
 ALL_DIR = os.path.join(SCRIPT_DIR, "data", "all")
+
+RUN_JSONL = os.path.join(RUNS_DIR, f"{RUN_STAMP}.jsonl")
+LATEST_JSONL = os.path.join(OUT_DIR, "latest.jsonl")
+DAILY_JSONL = os.path.join(OUT_DIR, "daily.jsonl")
 ALL_JSONL = os.path.join(ALL_DIR, "all.jsonl")
 
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -227,51 +267,10 @@ os.makedirs(ALL_DIR, exist_ok=True)
 
 print("📁 OUT_DIR:", OUT_DIR)
 print("🕒 RUN_STAMP:", RUN_STAMP)
+print("🔁 SCROLLS:", SCROLLS, "| 💬 ENABLE_COMMENTS:", ENABLE_COMMENTS)
 
 
-# ======================= JSONL HELPERS =======================
-def _read_jsonl(path: str):
-    if not os.path.exists(path):
-        return []
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
-    return rows
-
-def _write_jsonl(path: str, rows: list):
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-def _dedupe_rows(rows: list):
-    seen = set()
-    out = []
-    for r in rows:
-        tweet_url = (r.get("tweet_url") or "").strip()
-        t = (r.get("time") or "").strip()
-        tweet = (r.get("tweet") or "").strip()
-        username = (r.get("username") or "").strip()
-
-        if tweet_url:
-            key = (tweet_url, t)
-        else:
-            key = (tweet, t, username)
-
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
-    return out
-
-
-# ======================= BROWSER =======================
+# ----------------------- BROWSER -----------------------
 opts = Options()
 opts.add_argument("--headless=new")
 opts.add_argument("--no-sandbox")
@@ -294,19 +293,26 @@ time.sleep(5)
 print("✅ Login başarılı:", driver.current_url)
 
 
-# ======================= SCRAPE (SAME LOGIC) =======================
+# ----------------------- SCRAPE (BOTH PASSES) -----------------------
 KEYWORDS = ["bitcoin", "blockchain", "cryptocurrency"]
-MODES = ["top", "live"]
+
+# 1) default (genelde Top/son kullanılan sekme)
+# 2) live/latest
+SEARCH_PASSES = [
+    {"name": "default", "suffix": ""},          # f parametresi yok
+    {"name": "live", "suffix": "&f=live"},      # Latest
+]
+
 tweetArr = []
 
 for kw in KEYWORDS:
-    for mode in MODES:
-        print(f"\n🔎 {kw} | mode={mode}")
-        driver.get(f"https://x.com/search?q={kw}&src=typed_query&f={mode}")
+    for sp in SEARCH_PASSES:
+        print(f"\n🔎 {kw} | pass={sp['name']}")
+        driver.get(f"https://x.com/search?q={kw}&src=typed_query{sp['suffix']}")
         time.sleep(6)
 
         seen = set()
-        for _ in range(60):
+        for _ in range(SCROLLS):
             driver.execute_script("window.scrollBy(0, 1200);")
             time.sleep(random.uniform(2.0, 3.2))
             html = driver.page_source
@@ -323,11 +329,14 @@ for kw in KEYWORDS:
 
                     ttag = art.find("time")
                     tstr = ttag["datetime"] if ttag else None
+
+                    # run içi duplicate engeli (aynı sayfa içinde)
                     key = (text, tstr)
                     if key in seen:
                         continue
                     seen.add(key)
 
+                    # Tweet URL
                     tweet_url = None
                     time_link = ttag.find_parent("a") if ttag else None
                     if time_link:
@@ -336,14 +345,10 @@ for kw in KEYWORDS:
                             tweet_url = f"https://x.com{href}"
 
                     if not tweet_url:
-                        all_links = art.find_all("a", href=True)
-                        for link in all_links:
+                        for link in art.find_all("a", href=True):
                             href = link.get("href", "")
                             if "/status/" in href:
-                                if href.startswith("/"):
-                                    tweet_url = f"https://x.com{href}"
-                                else:
-                                    tweet_url = href
+                                tweet_url = f"https://x.com{href}" if href.startswith("/") else href
                                 break
 
                     reply = art.find(attrs={"data-testid": ["reply", "conversation"]})
@@ -354,10 +359,9 @@ for kw in KEYWORDS:
                     user_info = extract_user_info(art, driver, fetch_profile=False)
 
                     comments_data = []
-                    if tweet_url:
+                    if ENABLE_COMMENTS and tweet_url:
                         try:
-                            comments = extract_comments(tweet_url, driver, max_comments=5)
-                            comments_data = comments
+                            comments_data = extract_comments(tweet_url, driver, max_comments=5)
                             driver.back()
                             time.sleep(2)
                         except Exception as e:
@@ -369,6 +373,7 @@ for kw in KEYWORDS:
                                 pass
 
                     tweet_data = {
+                        "pass": sp["name"],  # default / live bilgisi
                         "keyword": kw,
                         "tweet": text,
                         "time": tstr,
@@ -382,67 +387,65 @@ for kw in KEYWORDS:
                         "follower_count": user_info["follower_count"],
                         "following_count": user_info["following_count"],
                         "comments_count": len(comments_data),
-                        "comments_data": comments_data  # <-- JSON olarak saklıyoruz (string değil)
+                        "comments_data": comments_data,  # JSON olarak (string değil)
                     }
 
                     tweetArr.append(tweet_data)
-                    time.sleep(random.uniform(0.5, 1.0))
+                    time.sleep(random.uniform(0.4, 0.9))
 
                 except Exception as e:
                     print(f"⚠️ Tweet işleme hatası: {e}")
                     continue
 
-        print(f"✅ {kw}/{mode}: {len(tweetArr)} tweet toplandı.")
+        print(f"✅ {kw}/{sp['name']}: {len(tweetArr)} toplam kayıt (kümülatif)")
 
 driver.quit()
-print(f"🟢 Toplam tweet sayısı: {len(tweetArr)}")
+print(f"🟢 Toplam tweet sayısı (kümülatif): {len(tweetArr)}")
 
 
-# ======================= SAVE (MIN CHANGE: CSV yerine JSONL) =======================
+# ----------------------- SAVE (JSONL run + daily + all) -----------------------
 df = pd.DataFrame(tweetArr)
 
 if not df.empty:
-    df.drop_duplicates(subset=["tweet", "time"], inplace=True)
+    df.drop_duplicates(subset=["tweet", "time", "tweet_url"], inplace=False)
     sort_cols = [c for c in ["like", "retweet", "comment", "see_count"] if c in df.columns]
     if sort_cols:
         df.sort_values(by=sort_cols, ascending=False, inplace=True)
 else:
     df = pd.DataFrame(columns=[
-        "keyword", "tweet", "time", "tweet_url",
+        "pass", "keyword", "tweet", "time", "tweet_url",
         "comment", "retweet", "like", "see_count",
         "username", "display_name", "follower_count", "following_count",
         "comments_count", "comments_data"
     ])
 
-# DataFrame -> list[dict]
 rows = df.to_dict(orient="records")
 
-# 1) Bu run dosyası (ayrı)
-_write_jsonl(RUN_JSONL, rows)
+# 1) run
+write_jsonl(RUN_JSONL, rows)
 
-# 2) latest.jsonl (overwrite)
-_write_jsonl(LATEST_JSONL, rows)
+# 2) latest (overwrite)
+write_jsonl(LATEST_JSONL, rows)
 
-# 3) daily.jsonl (merge + dedupe + overwrite)
-daily_old = _read_jsonl(DAILY_JSONL)
-daily_new = _dedupe_rows(daily_old + rows)
-_write_jsonl(DAILY_JSONL, daily_new)
+# 3) daily merge + dedupe
+daily_old = read_jsonl(DAILY_JSONL)
+daily_new = dedupe_rows(daily_old + rows)
+write_jsonl(DAILY_JSONL, daily_new)
 
-# 4) all.jsonl (merge + dedupe + overwrite)
-all_old = _read_jsonl(ALL_JSONL)
-all_new = _dedupe_rows(all_old + rows)
-_write_jsonl(ALL_JSONL, all_new)
+# 4) all merge + dedupe
+all_old = read_jsonl(ALL_JSONL)
+all_new = dedupe_rows(all_old + rows)
+write_jsonl(ALL_JSONL, all_new)
 
-print(f"💾 Kaydedildi (RUN): {RUN_JSONL} ({len(rows)} satır)")
-print(f"💾 Kaydedildi (LATEST): {LATEST_JSONL} ({len(rows)} satır)")
-print(f"💾 Kaydedildi (DAILY): {DAILY_JSONL} ({len(daily_new)} satır)")
-print(f"💾 Kaydedildi (ALL): {ALL_JSONL} ({len(all_new)} satır)")
+print(f"💾 RUN:    {RUN_JSONL} ({len(rows)} satır)")
+print(f"💾 LATEST: {LATEST_JSONL} ({len(rows)} satır)")
+print(f"💾 DAILY:  {DAILY_JSONL} ({len(daily_new)} satır)")
+print(f"💾 ALL:    {ALL_JSONL} ({len(all_new)} satır)")
 
-# 5) HF upload (opsiyonel)
+# 5) optional HF upload
 if HF_TOKEN and HF_REPO_ID and HF_AVAILABLE:
     try:
         api = HfApi()
-        # data/ klasörünün tamamını HF dataset repo'ya gönder
         api.upload_folder(
             folder_path=os.path.join(SCRIPT_DIR, "data"),
             repo_id=HF_REPO_ID,
