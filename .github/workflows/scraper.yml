@@ -1,0 +1,80 @@
+name: Twitter Scraper
+
+on:
+  schedule:
+    # Her 4 saatte bir çalıştır (UTC saatlerinde: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
+    - cron: '0 */4 * * *'
+  workflow_dispatch:  # Manuel çalıştırma için
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            chromium-browser \
+            chromium-chromedriver \
+            fonts-liberation \
+            libasound2 \
+            libatk-bridge2.0-0 \
+            libatk1.0-0 \
+            libatspi2.0-0 \
+            libcups2 \
+            libdbus-1-3 \
+            libdrm2 \
+            libgbm1 \
+            libgtk-3-0 \
+            libnspr4 \
+            libnss3 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxkbcommon0 \
+            libxrandr2 \
+            xdg-utils
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install jupyter nbconvert papermill
+
+      - name: Run scraper notebook
+        env:
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+          CT0: ${{ secrets.CT0 }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ secrets.HF_REPO_ID }}
+        run: |
+          papermill data.ipynb data_executed.ipynb --kernel python3 || \
+          jupyter nbconvert --to notebook --execute data.ipynb --output data_executed.ipynb
+
+      - name: Upload results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-data
+          path: |
+            /tmp/data/**/*.csv
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "✅ Scraping tamamlandı!"
+          if [ -n "$HF_TOKEN" ]; then
+            echo "📤 Veriler Hugging Face'e yüklendi: $HF_REPO"
+          fi
+
