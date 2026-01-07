@@ -20,37 +20,22 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install system dependencies
+      - name: Install Chrome & dependencies
         run: |
+          set -e
           sudo apt-get update
-          # Chromium ve bağımlılıklarını yükle (Ubuntu 24.04 uyumlu)
-          sudo apt-get install -y \
-            chromium-browser \
-            chromium-chromedriver \
-            fonts-liberation \
-            libasound2t64 \
-            libatk-bridge2.0-0 \
-            libatk1.0-0 \
-            libatspi2.0-0 \
-            libcups2t64 \
-            libdbus-1-3t64 \
-            libdrm2t64 \
-            libgbm1 \
-            libgtk-3-0t64 \
-            libnspr4t64 \
-            libnss3t64 \
-            libxcomposite1t64 \
-            libxdamage1t64 \
-            libxfixes3t64 \
-            libxkbcommon0t64 \
-            libxrandr2t64 \
-            xdg-utils
+          sudo apt-get install -y wget gnupg
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
 
       - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
+          set -e
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install jupyter nbconvert papermill
+          pip install jupyter nbconvert
 
       - name: Run scraper notebook
         env:
@@ -59,8 +44,10 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_REPO: ${{ secrets.HF_REPO_ID }}
         run: |
-          papermill data.ipynb data_executed.ipynb --kernel python3 || \
-          jupyter nbconvert --to notebook --execute data.ipynb --output data_executed.ipynb
+          set -e
+          echo "🚀 Starting Twitter Scraper..."
+          jupyter nbconvert --to notebook --execute data.ipynb --output output.ipynb --ExecutePreprocessor.timeout=1800
+          echo "✅ Scraper notebook executed successfully"
 
       - name: Upload results as artifact
         if: always()
