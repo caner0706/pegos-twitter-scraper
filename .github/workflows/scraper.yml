@@ -65,4 +65,5 @@ jobs:
           if [ -n "$HF_TOKEN" ]; then
             echo "📤 Veriler Hugging Face'e yüklendi: $HF_REPO"
           fi
+          
 
