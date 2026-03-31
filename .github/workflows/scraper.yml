@@ -3,7 +3,7 @@ name: Twitter Scraper
 on:
   schedule:
     # Her 4 saatte bir çalıştır (UTC saatlerinde: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
-    - cron: '0 */4 * * *'
+    - cron: '0 */5 * * *'
   workflow_dispatch:  # Manuel çalıştırma için
 
 jobs:
